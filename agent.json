@@ -1,0 +1,12 @@
+{
+  "name": "TODO",
+  "role": "TODO",
+  "mission": "TODO",
+  "owner": { "name": "TODO", "contact": "TODO" },
+  "serves": "TODO",
+  "success": "TODO",
+  "language": "TODO",
+  "timezone": "TODO",
+  "channels": [],
+  "tools": []
+}
