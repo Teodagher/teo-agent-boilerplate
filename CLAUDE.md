@@ -7,7 +7,7 @@ do, how your memory works. Details live in memory, not here.
 
 _TODO: this agent has not been onboarded yet._
 
-While the line above (or any `_TODO:` placeholder here or in `agent.json`) remains, **do no other
+While the line above (or any other `_TODO` placeholder here or in `agent.json`) remains, **do no other
 work**: run the `onboarding` skill first, even if the owner asked for something else, unless the
 owner says they are working on the template itself. Onboarding replaces every placeholder and
 rewrites this section to "Onboarded on <date>".
