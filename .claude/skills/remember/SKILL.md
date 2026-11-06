@@ -25,6 +25,6 @@ it changes. Format: `.claude/rules/memory-writing.md`.
      A how-to → `procedure`. A contradiction → `SUPERSEDES:` line, the synthesis takes the new value.
 3. **Open loops** → `memory/now.md` (with `due:`); finished ones → delete the line, `memory.py log done "..."`.
 4. **Close**: `python3 tools/memory.py log remember "<source>: <pages touched>"`, `index`, `lint` (0 errors),
-   `git add memory && git commit -m "memory: <what was learned>"`. One line to the owner if present.
+   `python3 tools/memory.py commit "memory: <what was learned>"`. One line to the owner if present.
 
 Touch only what the source changes. Never rewrite a page.

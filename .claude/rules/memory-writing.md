@@ -44,6 +44,6 @@ when), **Next** (queued). One line per loop, `due: YYYY-MM-DD` when dated. Done 
 `memory.py log done "..."`. Durable facts learned along the way go to wiki pages, not here.
 
 ## Secrets
-Memory is committed to git, raw files included. Never put a password, token, key or bank detail
+Memory may be committed to the owner's git repository, raw files included. Never put a password, token, key or bank detail
 anywhere in memory or in a reply: redact it to "[credential removed]" before filing text, ask the
 owner before filing a file that contains one, and write "credential present in source" in pages.
