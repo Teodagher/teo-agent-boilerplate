@@ -5,15 +5,22 @@
   memory.py file <path> | --text "<text>|-"  --date YYYY-MM-DD --kind <kind> --slug <slug>
   memory.py log <op> "title"
   memory.py index | lint [--hook] | status
-  memory.py guard        # PreToolUse hook: memory/raw/ is immutable
+  memory.py commit "message"   # commit only the own layer and memory, if git keeps them
+  memory.py guard        # PreToolUse hook: memory/raw/ and the installed template are read-only
+
+Every command except guard first copies missing starting files from seed/ (identity.md,
+LOCAL.md, memory/...), so a fresh "Use this template" copy works with no setup step. In a copy
+installed by a host (agent8), seed/ is read from the template under .agent8/template/<version>/.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import unicodedata
 from pathlib import Path
@@ -22,6 +29,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MEM = ROOT / "memory"
 WIKI, RAW = MEM / "wiki", MEM / "raw"
 INDEX, LOG, NOW = MEM / "index.md", MEM / "log.md", MEM / "now.md"
+IDENTITY, OWN_SKILLS, HOST = ROOT / "identity.md", ROOT / "skills", ROOT / ".agent8"
+# The copy's own files and data that `commit` may save. Never the template's files.
+OWN_PATHS = ("identity.md", "LOCAL.md", "skills", "mcp.local.json", "memory")
 # type -> (folder, template, index heading). Order = index order.
 TYPES = {
     "lesson": ("howto", "lesson", "Lessons (owner feedback: apply these)"),
@@ -33,7 +43,7 @@ TYPES = {
 }
 KINDS = {"chat", "email", "notes", "transcript", "doc", "sheet", "export", "contract", "image", "audio", "other"}
 LOG_OPS = {"setup", "remember", "recall", "tidy", "decision", "done", "lint"}
-MARKER = "_TODO:"  # onboarding placeholders in CLAUDE.md and agent.json
+MARKER = "_TODO:"  # onboarding placeholders in identity.md
 MAX_LINES, MAX_CHARS = 200, 10_000  # Claude Code caps SessionStart hook output
 
 DATE = r"\d{4}-\d{2}-\d{2}"
@@ -86,7 +96,97 @@ def pages() -> list[Page]:
 
 
 def onboarded() -> bool:
-    return not any(MARKER in read(ROOT / f) for f in ("CLAUDE.md", "agent.json"))
+    return IDENTITY.is_file() and MARKER not in read(IDENTITY)
+
+
+def identity() -> dict:
+    """The `- **Key:** value` lines of identity.md, keys lowercased."""
+    return {k.strip().lower(): v.strip() for k, v in re.findall(r"^- \*\*(.+?):\*\*[ \t]*(.*)$", read(IDENTITY), re.M)}
+
+
+# ------------------------------------------------------------------ seeds and own skills
+
+def _instance() -> str:
+    return read(HOST / "instance.yaml")
+
+
+def seed_dir() -> Path | None:
+    if (ROOT / "seed").is_dir():  # the template itself, or a "Use this template" copy
+        return ROOT / "seed"
+    m = re.search(r"^template:[ \t]*\n(?:[ \t]+.*\n)*?[ \t]+version:[ \t]*[\"']?([^\"'\s]+)", _instance(), re.M)
+    if m and (d := HOST / "template" / m.group(1) / "seed").is_dir():  # a copy installed by a host
+        return d
+    return None
+
+
+def answers() -> dict:
+    """Setup answers from .agent8/instance.yaml (simple `  id: value` lines under `answers:`)."""
+    m = re.search(r"^answers:[ \t]*\n((?:[ \t]+.*\n?)*)", _instance(), re.M)
+    out = {}
+    for line in (m.group(1).splitlines() if m else []):
+        k, sep, v = line.strip().partition(":")
+        if sep and re.fullmatch(r"[a-z][a-z0-9_]*", k) and v.strip():
+            out[k] = v.strip().strip("\"'")
+    return out
+
+
+def ensure_seeds() -> list[str]:
+    """Copy every seed file whose target is missing; never overwrite. Returns what was created."""
+    src = seed_dir()
+    if src is None:
+        return []
+    ans, made = answers(), []
+    for f in sorted(src.rglob("*")):
+        rel = f.relative_to(src)
+        dest = ROOT / rel
+        if not f.is_file() or dest.exists() or dest.is_symlink():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            text = f.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            shutil.copyfile(f, dest)
+        else:
+            text = re.sub(r"\{\{answer:([a-z][a-z0-9_]*)\}\}", lambda m: ans.get(m.group(1)) or f"{MARKER} {m.group(1)}", text)
+            dest.write_text(text, encoding="utf-8")
+        made.append(str(rel))
+    for d in (RAW, WIKI):
+        d.mkdir(parents=True, exist_ok=True)
+    return made
+
+
+def link_own_skills() -> list[str]:
+    """Without a host, make the copy's own skills (skills/<name>/) visible to Claude Code by
+    linking them into .claude/skills/ (.agents/skills links there too). A host such as agent8
+    composes those folders itself, so this does nothing in an installed copy."""
+    if HOST.exists():
+        return []
+    notes, live = [], ROOT / ".claude" / "skills"
+    if live.is_dir():
+        for link in live.iterdir():  # links to own skills that were removed
+            if link.is_symlink() and not link.exists() and os.readlink(link).startswith("../../skills/"):
+                link.unlink()
+    if not OWN_SKILLS.is_dir():
+        return notes
+    live.mkdir(parents=True, exist_ok=True)
+    for d in sorted(p for p in OWN_SKILLS.iterdir() if (p / "SKILL.md").is_file()):
+        link = live / d.name
+        if link.is_symlink() and os.readlink(link) == f"../../skills/{d.name}":
+            continue
+        if link.exists() or link.is_symlink():
+            notes.append(f"skills/{d.name} has the name of a template skill; the template's is used here: rename yours")
+            continue
+        try:
+            link.symlink_to(f"../../skills/{d.name}", target_is_directory=True)
+        except OSError as e:
+            notes.append(f"could not link skills/{d.name} into .claude/skills ({e})")
+            continue
+        exclude = ROOT / ".git" / "info" / "exclude"  # keep the link out of git, locally
+        if exclude.parent.is_dir() and f"/.claude/skills/{d.name}" not in read(exclude).splitlines():
+            with exclude.open("a", encoding="utf-8") as fh:
+                fh.write(f"/.claude/skills/{d.name}\n")
+        notes.append(f"skills/{d.name} is now available to Claude Code (from the next session)")
+    return notes
 
 
 # ------------------------------------------------------------------ commands
@@ -130,6 +230,7 @@ def cmd_file(a) -> None:
 
 
 def append_log(op: str, title: str) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as f:
         f.write(f"- {dt.datetime.now():%Y-%m-%d %H:%M} · {op} · {' '.join(title.split())}\n")
 
@@ -159,6 +260,7 @@ def build_index(ps: list[Page]) -> str:
 def cmd_index(a=None) -> None:
     new = build_index(pages())
     if new != read(INDEX):
+        INDEX.parent.mkdir(parents=True, exist_ok=True)
         INDEX.write_text(new, encoding="utf-8")
     if a is not None:
         print(f"memory/index.md: {new.count(chr(10))} lines")
@@ -173,7 +275,8 @@ def lint() -> tuple[list[str], list[str]]:
     E, W = [], []
     ps = pages()
     names = {p.stem for p in ps}
-    raws = {f.name for f in RAW.iterdir()} | {f.stem for f in RAW.iterdir()}
+    files = list(RAW.iterdir()) if RAW.is_dir() else []
+    raws = {f.name for f in files} | {f.stem for f in files}
     seen: dict[str, Path] = {}
     for p in ps:
         where = str(p.path.relative_to(ROOT))
@@ -241,7 +344,7 @@ def cmd_lint(a) -> None:
         for i in items:
             print(f"{tag}: {i}")
     if not onboarded():
-        print("info: not onboarded yet (_TODO: placeholders in CLAUDE.md / agent.json)")
+        print("info: not onboarded yet (identity.md is missing or holds _TODO: lines)")
     print(f"lint: {len(errors)} error(s), {len(warnings)} warning(s)")
     sys.exit(1 if errors else 0)
 
@@ -251,9 +354,10 @@ def cmd_status(a) -> None:
         out = ["## NOT ONBOARDED: run the onboarding skill before any other work (the owner can say "
                "\"onboard me\"), unless the owner says they are working on the template itself."]
     else:
-        c = json.loads(read(ROOT / "agent.json"))
+        c = identity()
         out = [f"## {c.get('name')}, {c.get('role')} · serves {c.get('serves')} · owner "
-               f"{c.get('owner', {}).get('name')} · {c.get('timezone')} · today {today()}"]
+               f"{c.get('owner')} · {c.get('timezone')} · today {today()}"]
+    out += [f"NOTE: {n}" for n in getattr(a, "notes", [])]
     out += [f"OVERDUE: {l}" for l in overdue()]
     log = [l for l in read(LOG).splitlines() if l.startswith("- ")][-3:]
     out += ["", "## Recent log", *(log or ["_empty_"]), "", *read(NOW).splitlines(), "", *read(INDEX).splitlines()]
@@ -273,19 +377,57 @@ def cmd_guard(a) -> None:
         data = json.load(sys.stdin)
     except ValueError:
         sys.exit(0)
-    ti, raw = data.get("tool_input") or {}, RAW.resolve()
-    blocked = False
+    ti, raw, tmpl = data.get("tool_input") or {}, RAW.resolve(), (HOST / "template").resolve()
+    blocked = None
     if data.get("tool_name") == "Bash":
         for seg in re.split(r"&&|\|\||;|\||\n", ti.get("command", "")):
             if "memory/raw" in seg and WRITE_RE.search(seg) and "tools/memory.py" not in seg:
-                blocked = True
+                blocked = "raw"
+            elif ".agent8/template" in seg and (WRITE_RE.search(seg) or re.search(r">>?\s*\S*\.agent8/template", seg)):
+                blocked = "template"
     elif target := ti.get("file_path") or ti.get("notebook_path"):
         p = Path(target)
-        blocked = (p if p.is_absolute() else Path(data.get("cwd") or ROOT) / p).resolve().is_relative_to(raw)
-    if blocked:
+        p = (p if p.is_absolute() else Path(data.get("cwd") or ROOT) / p).resolve()
+        blocked = "raw" if p.is_relative_to(raw) else "template" if p.is_relative_to(tmpl) else None
+    if blocked == "raw":
         print("memory/raw/ is immutable: never write, move or delete there. File sources with "
               "`python3 tools/memory.py file`; record corrections in the wiki.", file=sys.stderr)
         sys.exit(2)
+    if blocked == "template":
+        print(".agent8/template/ is the installed template, read-only: change how you work in "
+              "LOCAL.md or skills/ instead (AGENTS.md §6).", file=sys.stderr)
+        sys.exit(2)
+
+
+def git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+
+
+def cmd_commit(a) -> None:
+    """Commit the own layer and memory, by explicit path, never `git add -A`: template files and
+    anything else in the folder are left alone. Does nothing when this folder is not the top of
+    a git repository, or when the owner keeps these paths out of git (.gitignore,
+    .git/info/exclude)."""
+    try:
+        top = git("rev-parse", "--show-toplevel")
+    except FileNotFoundError:
+        print("git is not installed: nothing committed")
+        return
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != ROOT:
+        print("this folder is not a git repository of its own: nothing committed")
+        return
+    keep = [p for p in OWN_PATHS if (ROOT / p).exists() and git("check-ignore", "-q", p).returncode != 0]
+    if not keep:
+        print("your own files and memory are kept out of git here: nothing committed")
+        return
+    if (r := git("add", "-A", "--", *keep)).returncode != 0:
+        die(f"git add failed: {r.stderr.strip()}")
+    if git("diff", "--cached", "--quiet", "--", *keep).returncode == 0:
+        print("nothing new to commit")
+        return
+    if (r := git("commit", "-q", "-m", a.message, "--", *keep)).returncode != 0:
+        die(f"git commit failed: {(r.stderr or r.stdout).strip()}")
+    print(f"committed: {', '.join(keep)}")
 
 
 def main() -> None:
@@ -299,9 +441,13 @@ def main() -> None:
     s.set_defaults(fn=cmd_file)
     s = sub.add_parser("log"); s.add_argument("op"); s.add_argument("title"); s.set_defaults(fn=cmd_log)
     s = sub.add_parser("lint"); s.add_argument("--hook", action="store_true"); s.set_defaults(fn=cmd_lint)
+    s = sub.add_parser("commit"); s.add_argument("message"); s.set_defaults(fn=cmd_commit)
     for name, fn in (("index", cmd_index), ("status", cmd_status), ("guard", cmd_guard)):
         sub.add_parser(name).set_defaults(fn=fn)
     a = ap.parse_args()
+    if a.cmd != "guard":  # guard runs before every tool call: keep it read-only and fast
+        made = ensure_seeds()
+        a.notes = ([f"created from seed/: {', '.join(made)}"] if made else []) + link_own_skills()
     a.fn(a)
 
 
