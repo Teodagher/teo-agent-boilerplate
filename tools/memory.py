@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""Agent memory: deterministic bookkeeping for the agent's wiki.
+"""Agent memory bookkeeping. Stdlib only; paths resolve from the repo root.
 
-The agent writes knowledge; this script owns what must be deterministic:
-IDs, file placement, the generated index, the log, lint and the hooks.
-Stdlib only. Runs from anywhere: paths resolve from the repo root.
-
-  python3 tools/memory.py new <type> "Title" [--slug s]
-  python3 tools/memory.py file <path> --date YYYY-MM-DD --kind <kind> --slug <slug>
-  python3 tools/memory.py log <op> "title"
-  python3 tools/memory.py index
-  python3 tools/memory.py lint [--hook]
-  python3 tools/memory.py status
-  python3 tools/memory.py guard          # PreToolUse hook (reads hook JSON on stdin)
+  memory.py new <person|org|topic|decision|lesson|procedure> "Title" [--slug s]
+  memory.py file <path> | --text "<text>|-"  --date YYYY-MM-DD --kind <kind> --slug <slug>
+  memory.py log <op> "title"
+  memory.py index | lint [--hook] | status
+  memory.py guard        # PreToolUse hook: memory/raw/ is immutable
 """
 from __future__ import annotations
 
@@ -20,43 +14,33 @@ import datetime as dt
 import json
 import re
 import shutil
-import subprocess
 import sys
 import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MEM = ROOT / "memory"
-WIKI, RAW, INBOX = MEM / "wiki", MEM / "raw", MEM / "inbox"
-INDEX, LOG = MEM / "index.md", MEM / "log.md"
-TEMPLATES = ROOT / "templates"
-
-# type -> (ID prefix, folder under memory/wiki/, index heading). Order = index order.
+WIKI, RAW = MEM / "wiki", MEM / "raw"
+INDEX, LOG, NOW = MEM / "index.md", MEM / "log.md", MEM / "now.md"
+# type -> (folder, template, index heading). Order = index order.
 TYPES = {
-    "lesson": ("LES", "lessons", "Lessons (owner feedback: apply these)"),
-    "task": ("TSK", "tasks", "Tasks"),
-    "person": ("PER", "people", "People"),
-    "topic": ("TOP", "topics", "Topics"),
-    "decision": ("DEC", "decisions", "Decisions"),
-    "procedure": ("PRO", "procedures", "Procedures"),
-    "source": ("SRC", "sources", "Sources"),
+    "lesson": ("howto", "lesson", "Lessons (owner feedback: apply these)"),
+    "procedure": ("howto", "procedure", "Procedures"),
+    "person": ("entities", "entity", "People"),
+    "org": ("entities", "entity", "Organizations"),
+    "topic": ("entities", "entity", "Topics"),
+    "decision": ("entities", "entity", "Decisions"),
 }
-RAW_KINDS = {"chat", "email", "notes", "transcript", "doc", "sheet", "export",
-             "contract", "image", "audio", "other"}
-LOG_OPS = {"setup", "remember", "recall", "tidy", "decision", "update"}
-TASK_STATUS = {"todo", "doing", "waiting", "done"}
-DECISION_STATUS = {"active", "superseded"}
-REQUIRED = ("id", "type", "title", "updated", "reviewed")
-PLACEHOLDER = "_TODO:"
-INDEX_SPLIT_AT = 400  # lines; past this, split the index per type (see README, scaling)
+KINDS = {"chat", "email", "notes", "transcript", "doc", "sheet", "export", "contract", "image", "audio", "other"}
+LOG_OPS = {"setup", "remember", "recall", "tidy", "decision", "done", "lint"}
+MARKER = "_TODO:"  # onboarding placeholders in CLAUDE.md and agent.json
+MAX_LINES, MAX_CHARS = 200, 10_000  # Claude Code caps SessionStart hook output
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE = r"\d{4}-\d{2}-\d{2}"
 LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
-CODE_RE = re.compile(r"```.*?```|`[^`\n]*`|<!--.*?-->", re.S)  # examples, not content
-EVIDENCE_RE = re.compile(
-    r"^- \d{4}-\d{2}-\d{2} · (ADD|UPDATE|SUPERSEDE) · "
-    r"(stated|documented|observed|decided|inferred) · .+ — \[\[.+\]\].*$")
-LOG_RE = re.compile(r"^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} · \w+ · .+$")
+CODE_RE = re.compile(r"```.*?```|`[^`\n]*`|<!--.*?-->", re.S)
+EVIDENCE_RE = re.compile(rf"^- {DATE} · .+ — \[\[[^\]]+\]\]\s*$")
+DUE_RE = re.compile(r"due:\s*(\S+)")
 
 
 def today() -> str:
@@ -73,96 +57,81 @@ def die(msg: str) -> None:
     sys.exit(2)
 
 
-def rel(p: Path) -> str:
-    return str(p.relative_to(ROOT))
-
-
-# ------------------------------------------------------------------ pages
-
-def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Flat YAML only: `key: value` and `key: [a, b]`. Trailing ` # comments` ignored."""
-    if not text.startswith("---\n") or (end := text.find("\n---", 4)) == -1:
-        return {}, text
-    meta = {}
-    for line in text[4:end].splitlines():
-        line = line.split(" #", 1)[0].rstrip()
-        if ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        val = val.strip()
-        if val.startswith("[") and val.endswith("]"):
-            meta[key.strip()] = [v.strip().strip("'\"") for v in val[1:-1].split(",") if v.strip()]
-        else:
-            meta[key.strip()] = val.strip("'\"")
-    return meta, text[end + 4:].lstrip("\n")
-
-
-def evidence_bullets(body: str) -> list[str] | None:
-    """Bullets of `## Evidence log` (None if the section is missing)."""
-    m = re.search(r"^## Evidence log[ \t]*$(.*?)(?=^## |\Z)", body, re.S | re.M)
-    if not m:
-        return None
-    section = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
-    return [l.rstrip() for l in section.splitlines() if l.startswith("- ")]
+def read(p: Path) -> str:
+    return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
 class Page:
     def __init__(self, path: Path):
         self.path, self.stem = path, path.stem
-        self.meta, self.body = parse_frontmatter(path.read_text(encoding="utf-8"))
-        self.links = sorted({l.strip() for l in LINK_RE.findall(CODE_RE.sub("", self.body))})
-        self.evidence = evidence_bullets(self.body)
+        text = read(path)
+        self.meta, self.body = {}, text
+        if text.startswith("---\n") and (end := text.find("\n---", 4)) != -1:
+            for line in text[4:end].splitlines():
+                k, sep, v = line.partition(":")
+                if sep:
+                    self.meta[k.strip()] = v.strip()
+            self.body = text[end + 4:]
+        clean = CODE_RE.sub("", self.body)
+        self.links = sorted({l.strip() for l in LINK_RE.findall(clean)})
+        parts = re.split(r"^## Evidence log[ \t]*$", clean, maxsplit=1, flags=re.M)
+        self.evidence = None if len(parts) < 2 else [l.rstrip() for l in parts[1].splitlines() if l.strip()]
 
-    def get(self, key: str, default: str = "") -> str:
-        v = self.meta.get(key, default)
-        return ", ".join(v) if isinstance(v, list) else v
+    def get(self, k: str) -> str:
+        return self.meta.get(k, "")
 
 
-def load_pages() -> list[Page]:
+def pages() -> list[Page]:
     return [Page(p) for p in sorted(WIKI.rglob("*.md"))]
+
+
+def onboarded() -> bool:
+    return not any(MARKER in read(ROOT / f) for f in ("CLAUDE.md", "agent.json"))
 
 
 # ------------------------------------------------------------------ commands
 
 def cmd_new(a) -> None:
     if a.type not in TYPES:
-        die(f"unknown type {a.type!r}; one of: {', '.join(TYPES)}")
-    prefix, folder, _ = TYPES[a.type]
-    nums = [int(m.group(1)) for p in (WIKI / folder).glob(f"{prefix}-*.md")
-            if (m := re.match(rf"{prefix}-(\d+)", p.name))]
-    pid = f"{prefix}-{max(nums, default=0) + 1:03d}"
-    path = WIKI / folder / f"{pid}-{a.slug or slugify(a.title)}.md"
-    text = (TEMPLATES / f"{a.type}.md").read_text(encoding="utf-8")
-    for k, v in {"id": pid, "title": a.title, "today": today()}.items():
+        die(f"type must be one of: {', '.join(TYPES)}")
+    folder, template, _ = TYPES[a.type]
+    slug = slugify(a.slug or a.title)
+    if any(p.stem == slug for p in pages()):
+        die(f"a page named {slug} already exists: update it, or pass --slug")
+    text = read(ROOT / "templates" / f"{template}.md")
+    for k, v in {"title": a.title, "type": a.type, "today": today()}.items():
         text = text.replace("{{" + k + "}}", v)
+    if a.type == "decision":
+        text = text.replace("\nupdated:", "\nstatus: active\nupdated:", 1)
+    path = WIKI / folder / f"{slug}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    print(rel(path))
+    print(path.relative_to(ROOT))
 
 
 def cmd_file(a) -> None:
-    src = Path(a.path).resolve()
-    if not src.is_file():
+    if not re.fullmatch(DATE, a.date):
+        die("--date must be YYYY-MM-DD (the event's date)")
+    if a.kind not in KINDS:
+        die(f"--kind must be one of: {', '.join(sorted(KINDS))}")
+    if (a.path is None) == (a.text is None):
+        die("give either a file path or --text")
+    src = Path(a.path).resolve() if a.path else None
+    if src and not src.is_file():
         die(f"no such file: {a.path}")
-    if not DATE_RE.match(a.date):
-        die("--date must be YYYY-MM-DD (the date of the event, not today)")
-    if a.kind not in RAW_KINDS:
-        die(f"--kind must be one of: {', '.join(sorted(RAW_KINDS))}")
-    dest = RAW / f"{a.date}_{a.kind}_{slugify(a.slug)}{src.suffix.lower()}"
+    dest = RAW / f"{a.date}_{a.kind}_{slugify(a.slug)}{src.suffix.lower() if src else '.md'}"
     if dest.exists():
-        die(f"{rel(dest)} already exists; raw files are never overwritten (pick another --slug)")
-    if src.is_relative_to(RAW):
-        die("already in memory/raw/")
-    # Inbox items move (the inbox empties); files from elsewhere are copied, never deleted.
-    (shutil.move if src.is_relative_to(INBOX) else shutil.copy2)(src, dest)
-    print(rel(dest))
+        die(f"{dest.name} already exists; raw files are never overwritten (pick another --slug)")
+    if src:
+        shutil.copy2(src, dest)  # the original is left where it was
+    else:
+        dest.write_text(sys.stdin.read() if a.text == "-" else a.text, encoding="utf-8")
+    print(f"memory/raw/{dest.name}  (cite as [[raw/{dest.name}]])")
 
 
 def append_log(op: str, title: str) -> None:
-    line = f"- {dt.datetime.now():%Y-%m-%d %H:%M} · {op} · {title.strip()}\n"
     with LOG.open("a", encoding="utf-8") as f:
-        f.write(line)
-    print(line.strip())
+        f.write(f"- {dt.datetime.now():%Y-%m-%d %H:%M} · {op} · {' '.join(title.split())}\n")
 
 
 def cmd_log(a) -> None:
@@ -171,214 +140,167 @@ def cmd_log(a) -> None:
     append_log(a.op, a.title)
 
 
-def build_index(pages: list[Page]) -> str:
-    L = ["# Memory index", "",
-         "<!-- Generated by `python3 tools/memory.py index`. Do not edit by hand. -->",
-         "One line per page. Open a page only when the task needs it.", ""]
+def build_index(ps: list[Page]) -> str:
+    L = ["# Memory index", "", "<!-- Generated by `python3 tools/memory.py index`. Do not edit. -->", ""]
     for type_, (_, _, heading) in TYPES.items():
-        group = [p for p in pages if p.get("type") == type_]
-        if type_ == "task":  # open tasks first, by due date
-            group.sort(key=lambda p: (p.get("status") == "done", p.get("due") or "9999", p.stem))
-        L += [f"## {heading} ({len(group)})", ""]
-        for p in group:
-            tags = []
-            if type_ == "task":
-                tags = [p.get("status") or "?"] + ([f"due {p.get('due')}"] if p.get("due") else [])
-            elif type_ == "decision" and p.get("status") == "superseded":
-                tags = ["superseded"]
-            tag = f" ({' · '.join(tags)})" if tags else ""
-            L.append(f"- [[{p.stem}]]{tag} — {p.get('summary') or p.get('title')}")
-        L += (["_none yet_"] if not group else []) + [""]
+        group = [p for p in ps if p.get("type") == type_]
+        if group:
+            L += [f"## {heading}", ""]
+            for p in group:
+                tag = (f" (merged into [[{p.get('merged_into')}]])" if p.get("merged_into")
+                       else " (superseded)" if p.get("status") == "superseded" else "")
+                L.append(f"- [[{p.stem}]]{tag} — {p.get('summary') or p.get('title')}")
+            L.append("")
+    if len(L) == 4:
+        L += ["_Nothing remembered yet._", ""]
     return "\n".join(L).rstrip() + "\n"
 
 
-def cmd_index(a=None, quiet: bool = False) -> None:
-    new = build_index(load_pages())
-    old = INDEX.read_text(encoding="utf-8") if INDEX.exists() else ""
-    if new != old:
+def cmd_index(a=None) -> None:
+    new = build_index(pages())
+    if new != read(INDEX):
         INDEX.write_text(new, encoding="utf-8")
-    if not quiet:
-        print(f"{rel(INDEX)}: {new.count(chr(10))} lines" + (" (unchanged)" if new == old else ""))
+    if a is not None:
+        print(f"memory/index.md: {new.count(chr(10))} lines")
 
 
-def git(*args: str) -> str | None:
-    try:
-        r = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
-        return r.stdout if r.returncode == 0 else None
-    except FileNotFoundError:
-        return None
+def overdue() -> list[str]:
+    return [l.strip() for l in read(NOW).splitlines()
+            if (m := DUE_RE.search(l)) and re.fullmatch(DATE, m.group(1)) and m.group(1) < today()]
 
 
-def not_onboarded() -> bool:
-    if PLACEHOLDER in (ROOT / "CLAUDE.md").read_text(encoding="utf-8"):
-        return True
-    return "TODO" in (ROOT / "agent.json").read_text(encoding="utf-8")
-
-
-def lint() -> tuple[list[str], list[str], list[str]]:
-    """Returns (errors, warnings, infos). Errors block the Stop hook."""
-    E, W, I = [], [], []
-    pages = load_pages()
-    known = {p.stem for p in pages} | {p.get("id") for p in pages}
-    known |= {f.stem for f in RAW.iterdir()} | {f.name for f in RAW.iterdir()}
-    ids: dict[str, str] = {}
-    for p in pages:
-        where = rel(p.path)
-        for k in REQUIRED:
+def lint() -> tuple[list[str], list[str]]:
+    E, W = [], []
+    ps = pages()
+    names = {p.stem for p in ps}
+    raws = {f.name for f in RAW.iterdir()} | {f.stem for f in RAW.iterdir()}
+    seen: dict[str, Path] = {}
+    for p in ps:
+        where = str(p.path.relative_to(ROOT))
+        if p.stem in seen:
+            E.append(f"{where}: same name as {seen[p.stem].relative_to(ROOT)}; names are unique across the wiki")
+        seen[p.stem] = p.path
+        for k in ("title", "type", "updated"):
             if not p.get(k):
                 E.append(f"{where}: missing frontmatter `{k}`")
-        pid, type_ = p.get("id"), p.get("type")
-        if type_ not in TYPES:
-            E.append(f"{where}: unknown type {type_!r}")
-        else:
-            prefix, folder, _ = TYPES[type_]
-            if p.path.parent != WIKI / folder:
-                E.append(f"{where}: a {type_} page belongs in memory/wiki/{folder}/")
-            if not re.fullmatch(rf"{prefix}-\d{{3,}}", pid or ""):
-                E.append(f"{where}: id {pid!r} should look like {prefix}-001")
-        if pid and not p.stem.startswith(pid + "-"):
-            E.append(f"{where}: filename must start with its id `{pid}-`")
-        if pid in ids:
-            E.append(f"{where}: duplicate id {pid} (also {ids[pid]})")
-        ids[pid] = where
-        if p.get("updated") and not DATE_RE.match(p.get("updated")):
+        t = p.get("type")
+        if t not in TYPES:
+            E.append(f"{where}: type must be one of {', '.join(TYPES)}")
+        elif p.path.parent != WIKI / TYPES[t][0]:
+            E.append(f"{where}: a {t} page belongs in memory/wiki/{TYPES[t][0]}/")
+        if p.get("updated") and not re.fullmatch(DATE, p.get("updated")):
             E.append(f"{where}: `updated` must be YYYY-MM-DD")
-        if p.get("reviewed") not in ("true", "false"):
-            E.append(f"{where}: `reviewed` must be true or false")
-        if not p.get("summary"):
-            W.append(f"{where}: empty `summary` (the index shows the title instead)")
+        if p.get("status") and p.get("status") not in ("active", "superseded"):
+            E.append(f"{where}: status must be active or superseded")
+        for k in ("supersedes", "superseded_by", "merged_into"):
+            if p.get(k) and p.get(k) not in names:
+                E.append(f"{where}: `{k}: {p.get(k)}` is not a page")
+        if not p.get("summary") and not p.get("merged_into"):
+            W.append(f"{where}: empty summary (the index shows the title instead)")
         for link in p.links:
-            if link not in known:
-                E.append(f"{where}: broken link [[{link}]]")
+            ok = link[4:] in raws if link.startswith("raw/") else link in names
+            if not ok:
+                E.append(f"{where}: broken link [[{link}]] (pages: [[slug]], sources: [[raw/<file>]])")
         if p.evidence is None:
-            E.append(f"{where}: missing `## Evidence log` section")
-        for b in p.evidence or []:
-            if not EVIDENCE_RE.match(b):
-                E.append(f"{where}: bad evidence line (see .claude/rules/memory-writing.md): {b[:90]}")
-        if type_ == "task":
-            if p.get("status") not in TASK_STATUS:
-                E.append(f"{where}: task status must be one of {sorted(TASK_STATUS)}")
-            if p.get("due") and not DATE_RE.match(p.get("due")):
-                E.append(f"{where}: `due` must be YYYY-MM-DD or empty")
-            if p.get("status") != "done" and p.get("due") and p.get("due") < today():
-                W.append(f"{where}: overdue (due {p.get('due')})")
-        if type_ == "decision" and p.get("status") not in DECISION_STATUS:
-            E.append(f"{where}: decision status must be active or superseded")
-    # Append-only checks against the last commit (skipped outside git).
-    changed = git("diff", "--name-status", "HEAD", "--", "memory/")
-    for line in (changed or "").splitlines():
-        status, path = line.split("\t")[0], line.split("\t")[-1]
-        if path.startswith("memory/raw/") and status[0] in "MD":
-            E.append(f"{path}: raw files are immutable (modified/deleted since last commit); restore it")
-        elif path.startswith("memory/wiki/") and path.endswith(".md"):
-            if status[0] == "D":
-                E.append(f"{path}: wiki pages are never deleted; supersede or merge instead")
-            elif status[0] == "M":
-                old = evidence_bullets(parse_frontmatter(git("show", f"HEAD:{path}") or "")[1]) or []
-                new = set(evidence_bullets(Page(ROOT / path).body) or [])
-                for b in old:
-                    if b not in new:
-                        E.append(f"{path}: evidence log is append-only; removed/edited line: {b[:80]}")
-    if LOG.exists():
-        for n, l in enumerate(LOG.read_text(encoding="utf-8").splitlines(), 1):
-            if l.startswith("- ") and not LOG_RE.match(l):
-                W.append(f"memory/log.md:{n}: line not written by `memory.py log`")
-    if INDEX.exists() and INDEX.read_text(encoding="utf-8") != build_index(pages):
+            E.append(f"{where}: missing `## Evidence log` (last section)")
+        for line in p.evidence or []:
+            if line.startswith("## "):
+                E.append(f"{where}: `{line}` comes after the evidence log, which must be the last section")
+            elif not EVIDENCE_RE.match(line):
+                E.append(f"{where}: bad evidence line, want `- YYYY-MM-DD · fact — [[source]]`: {line[:80]}")
+    now = read(NOW)
+    for h in ("## Focus", "## Waiting on", "## Next"):
+        if not re.search(rf"^{h}\s*$", now, re.M):
+            E.append(f"memory/now.md: missing `{h}` section")
+    for m in DUE_RE.finditer(CODE_RE.sub("", now)):
+        if not re.fullmatch(DATE, m.group(1)):
+            E.append(f"memory/now.md: `due: {m.group(1)}` must be YYYY-MM-DD")
+    W += [f"memory/now.md: overdue: {l}" for l in overdue()]
+    if read(INDEX) != build_index(ps):
         E.append("memory/index.md is stale: run `python3 tools/memory.py index`")
-    if INDEX.exists() and INDEX.read_text(encoding="utf-8").count("\n") > INDEX_SPLIT_AT:
-        W.append(f"memory/index.md is over {INDEX_SPLIT_AT} lines: time to split it per type (README, scaling)")
-    if not_onboarded():
-        I.append("not onboarded yet: CLAUDE.md / agent.json still hold TODO placeholders; run the onboarding skill")
-    return E, W, I
+    return E, W
 
 
 def cmd_lint(a) -> None:
-    if a.hook:
+    if a.hook:  # Stop hook: rebuild the index, block once on errors, never loop
         try:
             payload = json.load(sys.stdin)
-        except Exception:
+        except ValueError:
             payload = {}
-        cmd_index(quiet=True)  # self-heal the generated index every turn
-        errors, _, _ = lint()
-        if errors and not payload.get("stop_hook_active"):
-            reason = "Memory lint failed; fix these before finishing:\n" + "\n".join(f"  - {e}" for e in errors)
+        cmd_index()
+        errors, _ = lint()
+        if errors and payload.get("stop_hook_active"):
+            print(f"memory lint: {len(errors)} error(s) left after a Stop block:\n" + "\n".join(errors), file=sys.stderr)
+            append_log("lint", f"{len(errors)} error(s) left unfixed after Stop block; first: {errors[0]}")
+        elif errors:
+            reason = "Memory lint failed; fix before finishing:\n" + "\n".join(f"  - {e}" for e in errors)
             print(json.dumps({"decision": "block", "reason": reason}))
         sys.exit(0)
-    errors, warnings, infos = lint()
-    for tag, items in (("error", errors), ("warning", warnings), ("info", infos)):
+    errors, warnings = lint()
+    for tag, items in (("error", errors), ("warning", warnings)):
         for i in items:
             print(f"{tag}: {i}")
+    if not onboarded():
+        print("info: not onboarded yet (_TODO: placeholders in CLAUDE.md / agent.json)")
     print(f"lint: {len(errors)} error(s), {len(warnings)} warning(s)")
     sys.exit(1 if errors else 0)
 
 
 def cmd_status(a) -> None:
-    if not_onboarded():
-        print("## Agent: NOT ONBOARDED. Do no other work: run the onboarding skill first (the owner can say \"onboard me\").")
+    if not onboarded():
+        out = ["## NOT ONBOARDED: run the onboarding skill before any other work (the owner can say "
+               "\"onboard me\"), unless the owner says they are working on the template itself."]
     else:
-        c = json.loads((ROOT / "agent.json").read_text(encoding="utf-8"))
-        owner = c.get("owner", {}).get("name", "?")
-        print(f"## Agent: {c.get('name')}, {c.get('role')} · serves {c.get('serves')} · owner {owner} "
-              f"· {c.get('language')} · {c.get('timezone')} · today {today()}")
-    inbox = [f for f in INBOX.iterdir() if f.name not in ("README.md", ".gitkeep")]
-    if inbox:
-        print(f"\nInbox: {len(inbox)} file(s) waiting; run the remember skill: " + ", ".join(f.name for f in inbox[:10]))
-    tasks = [p for p in load_pages() if p.get("type") == "task" and p.get("status") != "done"]
-    tasks.sort(key=lambda p: (p.get("due") or "9999", p.stem))
-    print(f"\n## Open tasks ({len(tasks)})")
-    for p in tasks[:15]:
-        due = p.get("due")
-        flag = " OVERDUE" if due and due < today() else ""
-        print(f"- [[{p.stem}]] {p.get('status')}{f' · due {due}' if due else ''}{flag} — {p.get('title')}")
-    if not tasks:
-        print("_none_")
-    log = LOG.read_text(encoding="utf-8").splitlines() if LOG.exists() else []
-    print("\n## Recent log")
-    print("\n".join([l for l in log if l.startswith("- ")][-5:]) or "_empty_")
-    if INDEX.exists():
-        lines = INDEX.read_text(encoding="utf-8").splitlines()
-        print("\n" + "\n".join(lines[:INDEX_SPLIT_AT]))
-        if len(lines) > INDEX_SPLIT_AT:
-            print(f"... index truncated at {INDEX_SPLIT_AT} lines; read memory/index.md")
+        c = json.loads(read(ROOT / "agent.json"))
+        out = [f"## {c.get('name')}, {c.get('role')} · serves {c.get('serves')} · owner "
+               f"{c.get('owner', {}).get('name')} · {c.get('timezone')} · today {today()}"]
+    out += [f"OVERDUE: {l}" for l in overdue()]
+    log = [l for l in read(LOG).splitlines() if l.startswith("- ")][-3:]
+    out += ["", "## Recent log", *(log or ["_empty_"]), "", *read(NOW).splitlines(), "", *read(INDEX).splitlines()]
+    text, cut = "\n".join(out), False
+    if len(out) > MAX_LINES:
+        text, cut = "\n".join(out[:MAX_LINES]), True
+    if len(text) > MAX_CHARS:
+        text, cut = text[:text.rfind("\n", 0, MAX_CHARS - 100)], True
+    print(text + ("\n... truncated: read memory/index.md for the rest." if cut else ""))
+
+
+WRITE_RE = re.compile(r"""\b(rm|mv|cp|tee|truncate|touch|chmod|ln|dd|install|rsync)\b|sed\s+(-\w*\s+)*-i|>>?\s*["']?[^\s"']*memory/raw|\bgit\s+(rm|mv|checkout|restore)\b""")
 
 
 def cmd_guard(a) -> None:
-    """PreToolUse hook for Write|Edit|MultiEdit|NotebookEdit: memory/raw/ is immutable."""
     try:
         data = json.load(sys.stdin)
-    except Exception:
+    except ValueError:
         sys.exit(0)
-    ti = data.get("tool_input") or {}
-    target = ti.get("file_path") or ti.get("notebook_path")
-    if target:
+    ti, raw = data.get("tool_input") or {}, RAW.resolve()
+    blocked = False
+    if data.get("tool_name") == "Bash":
+        for seg in re.split(r"&&|\|\||;|\||\n", ti.get("command", "")):
+            if "memory/raw" in seg and WRITE_RE.search(seg) and "tools/memory.py" not in seg:
+                blocked = True
+    elif target := ti.get("file_path") or ti.get("notebook_path"):
         p = Path(target)
-        p = (p if p.is_absolute() else Path(data.get("cwd") or ROOT) / p).resolve()
-        if p.is_relative_to(RAW.resolve()):
-            print("memory/raw/ is immutable: never write or edit there. Put the file in memory/inbox/, "
-                  "then `python3 tools/memory.py file ...`. Record corrections in the wiki.", file=sys.stderr)
-            sys.exit(2)
-    sys.exit(0)
+        blocked = (p if p.is_absolute() else Path(data.get("cwd") or ROOT) / p).resolve().is_relative_to(raw)
+    if blocked:
+        print("memory/raw/ is immutable: never write, move or delete there. File sources with "
+              "`python3 tools/memory.py file`; record corrections in the wiki.", file=sys.stderr)
+        sys.exit(2)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("new", help="create a page from templates/<type>.md with the next ID")
-    s.add_argument("type"); s.add_argument("title"); s.add_argument("--slug")
+    s = sub.add_parser("new"); s.add_argument("type"); s.add_argument("title"); s.add_argument("--slug")
     s.set_defaults(fn=cmd_new)
-    s = sub.add_parser("file", help="move an inbox file (or copy any file) into memory/raw/")
-    s.add_argument("path"); s.add_argument("--date", required=True)
-    s.add_argument("--kind", required=True); s.add_argument("--slug", required=True)
+    s = sub.add_parser("file"); s.add_argument("path", nargs="?"); s.add_argument("--text")
+    for k in ("--date", "--kind", "--slug"):
+        s.add_argument(k, required=True)
     s.set_defaults(fn=cmd_file)
-    s = sub.add_parser("log", help="append a line to memory/log.md")
-    s.add_argument("op"); s.add_argument("title")
-    s.set_defaults(fn=cmd_log)
-    sub.add_parser("index", help="regenerate memory/index.md").set_defaults(fn=cmd_index)
-    s = sub.add_parser("lint", help="check memory structure; exit 1 on errors")
-    s.add_argument("--hook", action="store_true", help="Stop-hook mode: JSON block decision on errors")
-    s.set_defaults(fn=cmd_lint)
-    sub.add_parser("status", help="session-start context").set_defaults(fn=cmd_status)
-    sub.add_parser("guard", help="PreToolUse hook: block writes under memory/raw/").set_defaults(fn=cmd_guard)
+    s = sub.add_parser("log"); s.add_argument("op"); s.add_argument("title"); s.set_defaults(fn=cmd_log)
+    s = sub.add_parser("lint"); s.add_argument("--hook", action="store_true"); s.set_defaults(fn=cmd_lint)
+    for name, fn in (("index", cmd_index), ("status", cmd_status), ("guard", cmd_guard)):
+        sub.add_parser(name).set_defaults(fn=fn)
     a = ap.parse_args()
     a.fn(a)
 

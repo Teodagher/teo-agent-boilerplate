@@ -1,22 +1,23 @@
 ---
-id: {{id}}
-type: lesson
 title: {{title}}
+type: {{type}}
 aliases: []
-summary:               # the rule itself in one line: it is what the index shows every session
+summary:
 updated: {{today}}
-reviewed: false
 ---
 
 # {{title}}
 
+<!-- Owner feedback. summary: the rule itself in one line (the index shows it every session). -->
+
 **What:** the rule, as the owner gave it.
 
-**Why:** the reason behind it (often an incident or a preference).
+**Why:** the reason behind it.
 
 **How to apply:** when it kicks in and what to do differently.
 
 ## Evidence log
-<!-- Append-only, oldest first. One line per fact change:
-- YYYY-MM-DD · ADD|UPDATE|SUPERSEDE · stated|documented|observed|decided|inferred · fact — [[citation]]
+<!-- Append-only, oldest first, always the LAST section. One line per fact:
+- YYYY-MM-DD · fact — [[raw/2026-01-31_email_invoice-dispute]]
+- YYYY-MM-DD · SUPERSEDES: old value · new fact — [[source]]
 -->

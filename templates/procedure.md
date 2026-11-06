@@ -1,22 +1,24 @@
 ---
-id: {{id}}
-type: procedure
 title: {{title}}
+type: {{type}}
 aliases: []
-when:                  # the situation that triggers this procedure
 summary:
 updated: {{today}}
-reviewed: false
 ---
 
 # {{title}}
 
-## When to use
-## Steps
+<!-- A how-to the agent learned. summary: when to use it, in one line. -->
+
+**When:** the situation that triggers it.
+
+**Steps:**
 1.
-## Pitfalls
+
+**Pitfalls:**
 
 ## Evidence log
-<!-- Append-only, oldest first. One line per fact change:
-- YYYY-MM-DD · ADD|UPDATE|SUPERSEDE · stated|documented|observed|decided|inferred · fact — [[citation]]
+<!-- Append-only, oldest first, always the LAST section. One line per fact:
+- YYYY-MM-DD · fact — [[raw/2026-01-31_email_invoice-dispute]]
+- YYYY-MM-DD · SUPERSEDES: old value · new fact — [[source]]
 -->
