@@ -1,12 +1,11 @@
 {
-  "name": "TODO",
-  "role": "TODO",
-  "mission": "TODO",
-  "owner": { "name": "TODO", "contact": "TODO" },
-  "serves": "TODO",
-  "success": "TODO",
-  "language": "TODO",
-  "timezone": "TODO",
+  "name": "_TODO: name",
+  "role": "_TODO: role",
+  "mission": "_TODO: mission",
+  "owner": { "name": "_TODO: owner name", "contact": "_TODO: owner contact" },
+  "serves": "_TODO: who it serves",
+  "language": "_TODO: language and tone",
+  "timezone": "_TODO: timezone",
   "channels": [],
   "tools": []
 }
