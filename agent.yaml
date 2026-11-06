@@ -1,0 +1,46 @@
+# Agent template manifest: an OpenGAP agent.yaml with the x-agent8 block (open agent template
+# format 0.2). Hosts such as agent8 read it to install the template; Claude Code doesn't need it.
+spec_version: "0.1.0"
+name: teo-agent-boilerplate
+version: 0.2.0
+description: A Claude Code agent with durable memory that grows without bloating its context. It interviews its owner on first launch, then works session after session.
+author: Teo Dagher
+license: MIT
+tags: [memory, personal-assistant, claude-code]
+
+x-agent8:
+  format: "0.2"
+  layout:
+    # Claude Code's own folder, so "Use this template" + `claude` works as-is.
+    # .agents/skills is a link to it, for Codex and other tools.
+    skills: .claude/skills
+  data:
+    # Everything the agent remembers is its owner's, never the template's.
+    - /memory/
+    # The owner's identity and hard rules (also part of the copy's own layer).
+    - /identity.md
+    - /logs/
+    - /exports/
+  setup:
+    - id: owner_name
+      prompt: Your name (the agent's owner)
+      type: string
+      required: true
+    - id: language
+      prompt: Language and tone the agent should use
+      type: string
+      default: English, short and warm
+    - id: timezone
+      prompt: Your timezone
+      type: string
+      default: Europe/Paris
+  # Needs no secret out of the box; tools added later declare theirs.
+  secrets: []
+  requires:
+    harnesses:
+      - name: claude-code
+      - name: codex
+        support: partial
+        note: Codex reads AGENTS.md and the skills; the Claude Code hooks (status at start, raw guard, lint at the end) are not translated, so the memory rules are advice only.
+    tools: ["git", "python3>=3.9"]
+    logins: [claude]
